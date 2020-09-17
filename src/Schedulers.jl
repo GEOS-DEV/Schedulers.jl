@@ -198,296 +198,87 @@ function epmap(f::Function, tasks, args...;
     nothing
 end
 
-"""
-    epmapreduce!(result, f, tasks, args...; epmap_kwargs..., kwargs...) -> result
+function epmapreduce!(result::AbstractArray{T,N}, f, tasks, f_args...; f_kwargs...) where {T}
+    verbosity > 0 && @info "creating pools..."
+    pools = partition(collect(tasks), poolsize)
 
-where f is the map function, and `tasks` are an iterable set of tasks to map over.  The
-positional arguments `args` and the named arguments `kwargs` are passed to `f` which has
-the method signature: `f(localresult, f, task, args; kwargs...)`.  `localresult` is a Future
-with an assoicated partial reduction.
+    copier = DistributedOperations.paralleloperations_copy!
+    reducer = DistributedOperations.paralleloperations_reduce!
+    filler = DistributedOperations.paralleloperations_fill!
 
-# pmap_kwargs
-* `epmap_minworkers=nworkers()` the minimum number of workers to elastically shrink to
-* `epmap_maxworkers=nworkers()` the maximum number of workers to elastically expand to
-* `epmap_quantum=32` the maximum number of workers to elastically add at a time
-* `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
-* `epmap_preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[1]
+    maxerrors = Inf
 
-# Example
-```julia
-using Distributed
-addprocs(2)
-@everywhere using Distributed, Schedulers
-@everywhere f(x, tsk) = (fetch(x)::Vector{Float32} .+= tsk; nothing)
-result = epmapreduce(zeros(Float32,10), f, 1:100)
-rmprocs(workers())
-"""
-function epmapreduce!(result::AbstractArray{T,N}, f, tasks, args...;
-        epmapreduce_id = randstring(6),
-        epmap_minworkers = nworkers(),
-        epmap_maxworkers = nworkers(),
-        epmap_quantum = 32,
-        epmap_addprocs = epmap_default_addprocs,
-        epmap_scratch = "/scratch",
-        kwargs...) where {T,N}
-    isdir(epmap_scratch) || mkpath(epmap_scratch)
-    empty!(_timers)
-    checkpoints = epmapreduce_map(f, tasks, T, size(result), args...;
-        epmapreduce_id=epmapreduce_id, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_scratch=epmap_scratch, kwargs...)
-    epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=epmapreduce_id, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_scratch=epmap_scratch)
-end
+    @info "creating Futures..."
+    futures = ArrayFutures(result, procs())
+    futures_copy = ArrayFutures(result, procs())
+    @info "...done creating Futures."
 
-function epmapreduce_map(f, tasks, ::Type{T}, n::NTuple{N,Int}, args...;
-        epmapreduce_id,
-        epmap_minworkers,
-        epmap_maxworkers,
-        epmap_quantum,
-        epmap_addprocs,
-        epmap_scratch,
-        kwargs...) where {T,N}
-    tsk_pool_todo = collect(tasks)
-    tsk_pool_done = []
-    interrupted = false
-    tsk_count = length(tsk_pool_todo)
+    fails = Dict{Int,Int}()
+    map(pid->fails[pid]=0, workers())
 
-    pid_channel = Channel{Int}(32)
-    rm_pid_channel = Channel{Int}(32)
-
-    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs)
-
-    localresults = Dict{Int, Future}()
-    checkpoints = Dict{Int, Any}()
-    orphans_compute = Set{Any}()
-    orphans_remove = Set{Any}()
-
-    _timers["map"] = Dict{Int, Dict{String,Float64}}()
-    tic_cumulative = Dict{Int,Float64}()
-
-    # task loop
-    @info "task loop..."
-    @sync while true
-        pid = take!(pid_channel)
-        pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
-
-        localresults[pid] = remotecall(zeros, pid, T, n)
-        checkpoints[pid] = nothing
-
-        _timers["map"][pid] = Dict("cumulative"=>0.0, "restart"=>0.0, "f"=>0.0, "checkpoint"=>0.0, "uptime"=>0.0)
-
-        tic_cumulative[pid] = time()
-        @async while true
-            isempty(tsk_pool_todo) && length(tsk_pool_done) == tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && break
-            _timers["map"][pid]["uptime"] = time() - _pid_up_timestamp[pid]
-            isempty(tsk_pool_todo) && length(tsk_pool_done) != tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && (yield(); continue)
-            _timers["map"][pid]["cumulative"] = time() - tic_cumulative[pid]
-
-            # re-start logic, reduce-in orphaned check-points
-            if !isempty(orphans_compute)
-                local orphan
-                try
-                    orphan = pop!(orphans_compute)
-                    _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(restart, pid, orphan, localresults[pid], T, n)
-                catch e
-                    @warn "caught restart error, reduce-in orhpan checkpoing"
-                    push!(orphans_compute, orphan)
-                    isa(e, ProcessExitedException) && (rmprocs(pid); break)
-                    error("TODO")
-                    throw(e)
+    while true
+        isempty(pools) && break
+        isexception = false
+        _pool = popfirst!(pools)
+        pool = copy(_pool)
+        try
+            N = length(pools) == 0 ? 0 : mapreduce(length, +, pools)
+            @sync for pid in workers()
+                @async while true
+                    isempty(pool) && break
+                    tsk = popfirst!(pool)
+                    try
+                        verbosity > 0 && @info "Scheduling task $tsk ($(N+length(pool)) remaining tasks)"
+                        remotecall_fetch(f, pid, tsk, futures, f_args...; f_kwargs...)
+                    catch e
+                        fails[pid] += 1
+                        @warn "caught exception, $(fails[pid]) failures on process $(pid)..."
+                        showerror(stderr, e)
+                        if fails[pid] > retries
+                            @warn "too many failures on process $(pid), removing from process list"
+                            rmprocs([pid])
+                        end
+                        throw(e)
+                    end
                 end
-                
-                try
-                    _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratch)
-                    _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T, n)
-                    old_checkpoint,checkpoints[pid] = checkpoints[pid],_next_checkpoint
-                    push!(orphans_remove, orphan)
-                    old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
-                catch e
-                    @warn "caught restart error, checkpointing"
-                    showerror(stdout, e)
-                    isa(e, ProcessExitedException) && (push!(orphans_compute, orphan); rmprocs(pid); break)
-                    error("TODO")
-                    throw(e)
-                end
-
-                isempty(orphans_compute) || continue
             end
-
-            # re-start logic, clean-up orphaned, but already reduced, check-points
-            if !isempty(orphans_remove)
-                local orphan
-                try
-                    orphan = pop!(orphans_remove)
-                    _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(rm_checkpoint, pid, orphan)
-                catch e
-                    @warn "caught restart error, clean-up"
-                    push!(orphans_remove, orphan)
-                    isa(e, ProcessExitedException) && (rmprocs(pid); break)
-                    error("TODO")
-                    throw(e)
-                end
-
-                isempty(orphans_remove) || continue
+        catch e
+            isexception = true
+            nerrors = sum(values(fails))
+            if nerrors >= maxerrors
+                error("Too many errors ($(nerrors)) thrown, maximum allowed number of errors is $(maxerrors).")
             end
+            push!(pools, _pool)
+            futures_copy = ArrayFutures(result, procs())
+            copy!(futures_copy, futures, copier, [1])
+            futures = ArrayFutures(result, procs())
+            copy!(futures, futures_copy, copier, [1])
+        end
 
-            length(tsk_pool_done) == tsk_count && break
-            isempty(tsk_pool_todo) && (yield(); continue)
-
-            # get next task
-            local tsk
-            try
-                tsk = popfirst!(tsk_pool_todo)
-            catch
-                yield()
-                continue
-            end
-
-            # compute and reduce
-            try
-                @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
-                _timers["map"][pid]["f"] += @elapsed remotecall_fetch(f, pid, localresults[pid], tsk, args...; kwargs...)
-                @debug "... task, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo -!"
-            catch e
-                @warn "pid=$pid, task loop, caught exception during f eval"
-                push!(tsk_pool_todo, tsk)
-                isa(e, ProcessExitedException) && (handle_process_exited(pid, localresults, checkpoints, orphans_compute); break)
-                showerror(stdout, e)
-                error("TODO")
-                throw(e)
-            end
-
-            # checkpoint
-            _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratch)
-            try
-                @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
-                _timers["map"][pid]["checkpoint"] += @elapsed remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T, n)
-                @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo -!"
-                push!(tsk_pool_done, tsk)
-            catch e
-                @warn "pid=$pid, task loop, caught exception during save_checkpoint"
-                isa(e, ProcessExitedException) && (push!(tsk_pool_todo, tsk); handle_process_exited(pid, localresults, checkpoints, orphans_compute); break)
-                showerror(stdout, e)
-                error("TODO")
-                throw(e)
-            end
-
-            # delete old checkpoint
-            old_checkpoint,checkpoints[pid] = checkpoints[pid],_next_checkpoint
-            try
-                if old_checkpoint != nothing
-                    _timers["map"][pid]["checkpoint"] += @elapsed remotecall_fetch(rm_checkpoint, pid, old_checkpoint)
-                end
-            catch e
-                @warn "pid=$pid, task loop, caught exception during rm_checkpoint"
-                old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
-                isa(e, ProcessExitedException) && (handle_process_exited(pid, localresults, checkpoints, orphans_remove); break)
-                error("TODO")
-                throw(e)
+        if !isexception
+            if isempty(pools)
+                reduce!(futures, reducer)
+            else
+                copy!(futures_copy, futures, copier)
+                reduce!(futures_copy, reducer)
+                copy!(futures, futures_copy, copier, [1])
+                nprocs() > nworkers() && fill!(futures, 0, filler, workers())
             end
         end
     end
-    fetch(_elastic_loop)
-    @info "...done task loop"
-    filter!(checkpoint->checkpoint != nothing, [collect(values(checkpoints)); orphans_compute...])
-end
-
-function epmapreduce_reduce!(result::AbstractArray{T,N}, checkpoints;
-        epmapreduce_id,
-        epmap_minworkers,
-        epmap_maxworkers,
-        epmap_quantum,
-        epmap_addprocs,
-        epmap_scratch) where {T,N}
-    @info "reduce loop..."
-    n_checkpoints = length(checkpoints)
-    # reduce loop, tsk_pool_todo and tsk_pool_done are not really needed, but lets us reuse the elastic_loop method
-    tsk_pool_todo = [1:n_checkpoints-1;]
-    tsk_pool_done = Int[]
-    ntsks = length(tsk_pool_todo)
-    interrupted = false
-
-    pid_channel = Channel{Int}(32)
-    rm_pid_channel = Channel{Int}(32)
-    
-    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, ntsks, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs)
-
-    _timers["reduce"] = Dict{Int, Dict{String,Float64}}()
-
-    orphans_remove = Set{String}()
-
-    @sync while true
-        pid = take!(pid_channel)
-        @debug "pid=$pid"
-        pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
-
-        _timers["reduce"][pid] = Dict("cumulative"=>0.0, "reduce"=>0.0, "IO"=>0.0, "cleanup"=>0.0, "uptime"=>0.0)
-
-        tic_cumulative = time()
-        @async while true
-            _timers["reduce"][pid]["cumulative"] = time() - tic_cumulative
-            _timers["reduce"][pid]["uptime"] = time() - _pid_up_timestamp[pid]
-
-            length(tsk_pool_done) == ntsks && break
-            length(checkpoints) < 2 && (yield(); continue)
-
-            tsk = popfirst!(tsk_pool_todo)
-
-            local checkpoint1,checkpoint2,checkpoint3
-            try
-                checkpoint1,checkpoint2,checkpoint3 = popfirst!(checkpoints),popfirst!(checkpoints),next_checkpoint(epmapreduce_id, epmap_scratch)
-            catch
-                continue
-            end
-            
-            try
-                t_io, t_sum = remotecall_fetch(reduce, pid, checkpoint1, checkpoint2, checkpoint3, T, size(result))
-                _timers["reduce"][pid]["IO"] += t_io
-                _timers["reduce"][pid]["reduce"] += t_sum
-                push!(checkpoints, checkpoint3)
-                push!(tsk_pool_done, tsk)
-            catch e
-                @warn "pid=$pid, reduce loop, caught exception during reduce"
-                showerror(stdout, e)
-                push!(checkpoints, checkpoint1, checkpoint2)
-                push!(tsk_pool_todo, tsk)
-                isa(e, ProcessExitedException) && (rmprocs(pid); break)
-                error("TODO")
-                throw(e)
-            end
-
-            try
-                _timers["reduce"][pid]["cleanup"] += @elapsed remotecall_fetch(rm_checkpoint, pid, checkpoint1)
-            catch e
-                @warn "pid=$pid, reduce loop, caught exception during rm_checkpoint 1"
-                push!(orphans_remove, checkpoint1, checkpoint2)
-                isa(e, ProcessExitedException) && (rmprocs(pid); break)
-                error("TODO")
-                throw(e)
-            end
-            
-            try
-                _timers["reduce"][pid]["cleanup"] += @elapsed remotecall_fetch(rm_checkpoint, pid, checkpoint2)
-            catch e
-                @warn "pid=$pid, reduce loop, caught exception during rm_checkpoint 2"
-                push!(orphans_remove, checkpoint2)
-                isa(e, ProcessExitedException) && (rmprocs(pid) && break)
-                error("TODO")
-                throw(e)
-            end
-        end
-    end
-    fetch(_elastic_loop)
-    @info "...done reduce loop."
-
-    # ensure we are left with epmap_minworkers
-    _workers = workers()
-    1 ∈ _workers && popfirst!(_workers)
-    rmprocs(_workers[1:(length(_workers) - epmap_minworkers)])
-
-    x = read!(checkpoints[1], result)
-    rm_checkpoint(checkpoints[1])
-    rm_checkpoint.(orphans_remove)
     x
+end
+
+function partition(pool, N)
+    pools = Vector{Int}[]
+    last = 0
+    while true
+        frst = last + 1
+        last = min(frst+N-1,length(pool))
+        push!(pools, pool[frst:last])
+        last == length(pool) && break
+    end
+    pools
 end
 
 const _timers = Dict{String,Dict{Int,Dict{String,Float64}}}()
