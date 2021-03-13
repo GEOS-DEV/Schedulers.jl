@@ -234,7 +234,9 @@ function epmap(f::Function, tasks, args...;
             end
         end
     end
+    @debug "exited task loop, and waiting for elastic loop to exit"
     fetch(_elastic_loop)
+    @debug "exited elastic loop"
 
     # ensure we are left with epmap_minworkers
     _workers = workers()
