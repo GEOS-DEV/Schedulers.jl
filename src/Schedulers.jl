@@ -236,7 +236,10 @@ function epmap(f::Function, tasks, args...;
                     throw(e)
                 elseif isa(e, ProcessExitedException)
                     @warn "process with id=$pid exited, removing from process list"
-                    rmprocs(pid; waitfor=120)
+                    @debug "map_pid_wrkr, $(Distributed.map_pid_wrkr)"
+                    task_rmprocs = rmprocs(pid)
+                    x = fetch(task_rmprocs)
+                    @show x
                     break
                 elseif nerrors >= epmap_maxerrors
                     interrupted = true
