@@ -182,6 +182,8 @@ function epmap(f::Function, tasks, args...;
 
     fails = Dict{Int,Int}()
 
+    wrkrs = Dict{Int, Distributed.Worker}()
+
     interrupted = false
 
     _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
@@ -190,6 +192,13 @@ function epmap(f::Function, tasks, args...;
     @sync while true
         interrupted && break
         pid = take!(pid_channel)
+
+        if haskey(Distributed.map_pid_wrkr, pid)
+            wrkrs[pid] = Distributed.map_pid_wrkr[pid]
+        else
+            @warn "worker with pid=$pid is not registered"
+        end
+
         fails[pid] = 0
         @debug "pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
@@ -236,10 +245,14 @@ function epmap(f::Function, tasks, args...;
                     throw(e)
                 elseif isa(e, ProcessExitedException)
                     @warn "process with id=$pid exited, removing from process list"
-                    @debug "map_pid_wrkr, $(Distributed.map_pid_wrkr)"
-                    task_rmprocs = rmprocs(pid)
-                    x = fetch(task_rmprocs)
-                    @show x
+                    if haskey(Distributed.map_pid_wrkr, pid)
+                       @debug "pid=$pid is known to Distributed, calling rmprocs"
+                       rmprocs(pid)
+                    else
+                        @debug "pid=$pid is not known to Distributed, calling kill"
+                        Distributed.kill(wrkrs[pid].manager, pid, wrkrs[pid].config)
+                    end
+                    delete!(wrkrs, pid)
                     break
                 elseif nerrors >= epmap_maxerrors
                     interrupted = true
